@@ -13,7 +13,7 @@ import (
 func main() {
 	config := server.Config{
 		Port:           5432,
-		MaxConnections: 1000000000000000000,
+		MaxConnections: 100000,
 	}
 
 	cat := catalog.NewCatalog()
