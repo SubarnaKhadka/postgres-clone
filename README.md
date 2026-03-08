@@ -126,14 +126,14 @@ We must use `recover()` at connection boundaries.
 - Filter: evaluate WHERE clause on each tuple.
 - Return RowDescription + DataRow messages.
 
-### 3.6: Simple Expressions (Implementing) 
+### 3.6: Simple Expressions 
 - Comparison operators: =, !=, <, >, <=, >=
 - Logical operators: AND, OR, NOT
 - Literal values: integers, strings, booleans, NULL
 - IS NULL / IS NOT NULL
 - Column references
 
-## Next Plan: UPDATE, DELETE, and Basic MVCC
+## Day 4: UPDATE, DELETE, and Basic MVCC
 **Goal:** Modify and delete rows with basic multi-version concurrency control.
 
 ### 4.1: Transaction IDs
@@ -165,3 +165,57 @@ We must use `recover()` at connection boundaries.
 - Parse: `UPDATE table SET col1 = expr WHERE condition`
 - For each matching tuple: mark old version with xmax, insert new version with xmin.
 - Return CommandComplete ("UPDATE N").
+
+
+## Day 5: Explicit Transactions (BEGIN/COMMIT/ROLLBACK)
+**Goal:** Support multi-statement transactions with proper isolation.
+
+### 5.1: Transaction State Machine
+- States: Idle -> InTransaction -> Failed (aborted)
+- BEGIN: assign XID, enter InTransaction state, ReadyForQuery sends 'T'.
+- COMMIT: mark XID as committed in CLOG, send CommandComplete, back to Idle ('I').
+- ROLLBACK: mark XID as aborted, send CommandComplete, back to Idle.
+- Error in transaction: enter Failed state, reject all commands except ROLLBACK.
+
+### 5.2: Snapshots
+- On statement start (READ COMMITTED) or transaction start (REPEATABLE READ):
+  capture snapshot of in-progress XIDs.
+- Use snapshot for all visibility checks during that statement/transaction.
+
+### 5.3: Row-Level Locking (Implementing)
+- SELECT FOR UPDATE: set xmax with a lock-only flag.
+- Other transactions wanting to update the same row must wait.
+- Wait-for tracking to enable deadlock detection later.
+
+
+## Next Plan: WAL + Crash Recovery
+**Goal:** Durability — survive crashes without data loss.
+
+### 6.1: WAL Infrastructure
+- WAL record format: header + resource type + page references + data.
+- WAL buffer: in-memory buffer for pending records.
+- WAL file management: segment files, sequential writing.
+
+### 6.2: WAL Records for Operations
+- Heap INSERT: log the full tuple.
+- Heap DELETE: log the TID and xmax.
+- Heap UPDATE: log both old TID and new tuple.
+- Transaction COMMIT/ABORT: log the status change.
+
+### 6.3: WAL Flush on Commit
+- When a transaction commits, flush WAL up to the commit record's LSN.
+- Use `fsync()` / `fdatasync()` to guarantee durability.
+
+### 6.4: Crash Recovery
+- On startup, check for unclean shutdown.
+- Read WAL from last checkpoint's redo point.
+- Replay all records where page LSN < record LSN.
+- Mark incomplete transactions as aborted.
+
+### 6.5: Checkpointer
+- Background goroutine that periodically:
+  1. Writes a checkpoint-start record to WAL.
+  2. Flushes all dirty buffer pool pages to disk.
+  3. Writes a checkpoint-complete record.
+  4. Updates the control file with the redo point.
+- After checkpoint, WAL before the redo point can be recycled.
