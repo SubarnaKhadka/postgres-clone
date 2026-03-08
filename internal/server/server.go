@@ -10,10 +10,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gopostgres/internal/ast"
 	"gopostgres/internal/catalog"
 	"gopostgres/internal/executor"
 	"gopostgres/internal/parser"
 	"gopostgres/internal/protocol"
+	"gopostgres/internal/txn"
 	"gopostgres/internal/types"
 )
 
@@ -26,6 +28,7 @@ type Server struct {
 	nextConnID atomic.Int32
 	config     Config
 	catalog    *catalog.Catalog
+	txnManager *txn.TxnManager
 }
 
 type Config struct {
@@ -37,10 +40,11 @@ func NewServer(config Config, cat *catalog.Catalog) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Server{
-		config:  config,
-		catalog: cat,
-		ctx:     ctx,
-		cancel:  cancel,
+		config:     config,
+		catalog:    cat,
+		ctx:        ctx,
+		cancel:     cancel,
+		txnManager: txn.NewTxnManager(),
 	}
 }
 
@@ -83,6 +87,17 @@ func (s *Server) Start() error {
 
 		s.wg.Add(1)
 		go s.handleConnection(conn)
+	}
+}
+
+func txnStatusByte(state txn.TxnState) byte {
+	switch state {
+	case txn.TxnInTransaction:
+		return 'T'
+	case txn.TxnFailed:
+		return 'E'
+	default:
+		return 'I'
 	}
 }
 
@@ -150,6 +165,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
+	connTxn := &txn.ConnTransaction{State: txn.TxnIdle, XID: 0}
+
 	for {
 		messageType, message, err := protocol.ReadMessage(conn)
 		if err != nil {
@@ -165,15 +182,65 @@ func (s *Server) handleConnection(conn net.Conn) {
 			p := parser.NewParser(sql)
 			stmt, err := p.Parse()
 			if err != nil {
+				if connTxn.State == txn.TxnInTransaction {
+					connTxn.State = txn.TxnFailed
+				}
 				protocol.WriteErrorResponse(conn, err.Error())
-				protocol.WriteReadyForQuery(conn, 'I')
+				protocol.WriteReadyForQuery(conn, txnStatusByte(connTxn.State))
 				continue
 			}
-			exec := executor.NewExecutor(s.catalog)
+
+			switch stmt.(type) {
+			case *ast.BeginStatement:
+				if connTxn.State == txn.TxnInTransaction {
+					protocol.WriteErrorResponse(conn, "WARNING: Already in transaction")
+				} else {
+					connTxn.XID = s.txnManager.NextXID()
+					connTxn.State = txn.TxnInTransaction
+				}
+				protocol.WriteCommandComplete(conn, "BEGIN")
+				protocol.WriteReadyForQuery(conn, txnStatusByte(connTxn.State))
+				continue
+
+			case *ast.CommitStatement:
+				if connTxn.State == txn.TxnInTransaction {
+					s.txnManager.Commit(connTxn.XID)
+				} else if connTxn.State == txn.TxnFailed {
+					s.txnManager.Abort(connTxn.XID)
+				}
+
+				connTxn.State = txn.TxnIdle
+				connTxn.XID = 0
+				protocol.WriteCommandComplete(conn, "COMMIT")
+				protocol.WriteReadyForQuery(conn, txnStatusByte(connTxn.State))
+				continue
+
+			case *ast.RollbackStatement:
+				if connTxn.State == txn.TxnInTransaction || connTxn.State == txn.TxnFailed {
+					s.txnManager.Abort(connTxn.XID)
+				}
+				connTxn.State = txn.TxnIdle
+				connTxn.XID = 0
+				protocol.WriteCommandComplete(conn, "ROLLBACK")
+				protocol.WriteReadyForQuery(conn, txnStatusByte(connTxn.State))
+				continue
+			}
+
+			if connTxn.State == txn.TxnFailed {
+				protocol.WriteErrorResponse(conn, "ERROR: Transaction failed")
+				protocol.WriteReadyForQuery(conn, txnStatusByte(connTxn.State))
+				continue
+			}
+
+			snapShot := s.txnManager.TakeSnapshot()
+			exec := executor.NewExecutor(s.catalog, s.txnManager, connTxn.XID, snapShot)
 			result, err := exec.Execute(stmt)
 			if err != nil {
+				if connTxn.State == txn.TxnInTransaction {
+					connTxn.State = txn.TxnFailed
+				}
 				protocol.WriteErrorResponse(conn, err.Error())
-				protocol.WriteReadyForQuery(conn, 'I')
+				protocol.WriteReadyForQuery(conn, txnStatusByte(connTxn.State))
 				continue
 			}
 
@@ -207,7 +274,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				}
 			}
 			protocol.WriteCommandComplete(conn, result.Tag)
-			protocol.WriteReadyForQuery(conn, 'I')
+			protocol.WriteReadyForQuery(conn, txnStatusByte(connTxn.State))
 
 		case 'X':
 			slog.Info("Client disconnected")
@@ -215,7 +282,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		default:
 			protocol.WriteErrorResponse(conn, "Unsupported message type")
-			protocol.WriteReadyForQuery(conn, 'I')
+			protocol.WriteReadyForQuery(conn, txnStatusByte(connTxn.State))
 		}
 	}
 }

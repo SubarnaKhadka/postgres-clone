@@ -37,6 +37,28 @@ type SelectStatement struct {
 	Where   Expression // nil means no WHERE clause
 }
 
+type SetClause struct {
+	Column string
+	Value  Expression
+}
+
+type UpdateStatement struct {
+	Table      string
+	SetClauses []*SetClause
+	Where      Expression
+}
+
+type DeleteStatement struct {
+	Table string
+	Where Expression
+}
+
+type (
+	BeginStatement    struct{}
+	CommitStatement   struct{}
+	RollbackStatement struct{}
+)
+
 type ColumnRef struct {
 	Name string
 }
@@ -60,6 +82,11 @@ func (s *CreateTableStatement) statementNode() {}
 func (s *DropTableStatement) statementNode()   {}
 func (s *InsertStatement) statementNode()      {}
 func (s *SelectStatement) statementNode()      {}
+func (s *DeleteStatement) statementNode()      {}
+func (s *UpdateStatement) statementNode()      {}
+func (s *BeginStatement) statementNode()       {}
+func (s *CommitStatement) statementNode()      {}
+func (s *RollbackStatement) statementNode()    {}
 
 type IntegerLiteral struct {
 	Value int64

@@ -57,6 +57,16 @@ func (p *Parser) Parse() (ast.Statement, error) {
 			return p.parseInsert()
 		case "SELECT":
 			return p.parseSelect()
+		case "UPDATE":
+			return p.parseUpdate()
+		case "DELETE":
+			return p.parseDelete()
+		case "BEGIN":
+			return p.parseBegin()
+		case "COMMIT":
+			return p.parseCommit()
+		case "ROLLBACK":
+			return p.parseRollback()
 		}
 	}
 	return nil, fmt.Errorf("unexpected token %q", p.current.Value)
@@ -325,6 +335,152 @@ func (p *Parser) parseSelect() (*ast.SelectStatement, error) {
 		Table:   nameTok.Value,
 		Where:   where,
 	}, nil
+}
+
+func (p *Parser) parseUpdate() (*ast.UpdateStatement, error) {
+	// UPDATE
+	if err := p.expectKeyword("UPDATE"); err != nil {
+		return nil, err
+	}
+
+	// table name
+	nameTok, err := p.expectToken(TOKEN_IDENT)
+	if err != nil {
+		return nil, err
+	}
+
+	// SET
+	if err := p.expectKeyword("SET"); err != nil {
+		return nil, err
+	}
+
+	// set clauses
+	var clauses []*ast.SetClause
+	for {
+		col, err := p.expectToken(TOKEN_IDENT)
+		if err != nil {
+			return nil, err
+		}
+
+		if _, err := p.expectToken(TOKEN_EQ); err != nil {
+			return nil, err
+		}
+		value, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+
+		clauses = append(clauses, &ast.SetClause{
+			Column: col.Value,
+			Value:  value,
+		})
+
+		if p.peek().Type != TOKEN_COMMA {
+			break
+		}
+		p.advance()
+	}
+
+	// optional WHERE
+	var where ast.Expression
+	if p.peek().Type == TOKEN_KEYWORD && p.peek().Value == "WHERE" {
+		p.advance()
+		where, err = p.parseWhereExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// optional ;
+	if p.peek().Type == TOKEN_SEMICOLON {
+		p.advance()
+	}
+
+	return &ast.UpdateStatement{
+		Table:      nameTok.Value,
+		SetClauses: clauses,
+		Where:      where,
+	}, nil
+}
+
+func (p *Parser) parseDelete() (*ast.DeleteStatement, error) {
+	// DELETE
+	if err := p.expectKeyword("DELETE"); err != nil {
+		return nil, err
+	}
+
+	// FROM
+	if err := p.expectKeyword("FROM"); err != nil {
+		return nil, err
+	}
+
+	// table name
+	nameTok, err := p.expectToken(TOKEN_IDENT)
+	if err != nil {
+		return nil, err
+	}
+
+	// optional WHERE
+	var where ast.Expression
+	if p.peek().Type == TOKEN_KEYWORD && p.peek().Value == "WHERE" {
+		p.advance()
+		where, err = p.parseWhereExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// optional ;
+	if p.peek().Type == TOKEN_SEMICOLON {
+		p.advance()
+	}
+
+	return &ast.DeleteStatement{
+		Table: nameTok.Value,
+		Where: where,
+	}, nil
+}
+
+func (p *Parser) parseBegin() (*ast.BeginStatement, error) {
+	// BEGIN
+	if err := p.expectKeyword("BEGIN"); err != nil {
+		return nil, err
+	}
+
+	// optional ;
+	if p.peek().Type == TOKEN_SEMICOLON {
+		p.advance()
+	}
+
+	return &ast.BeginStatement{}, nil
+}
+
+func (p *Parser) parseCommit() (*ast.CommitStatement, error) {
+	// COMMIT
+	if err := p.expectKeyword("COMMIT"); err != nil {
+		return nil, err
+	}
+
+	// optional ;
+	if p.peek().Type == TOKEN_SEMICOLON {
+		p.advance()
+	}
+
+	return &ast.CommitStatement{}, nil
+}
+
+func (p *Parser) parseRollback() (*ast.RollbackStatement, error) {
+	// ROLLBACK
+	if err := p.expectKeyword("ROLLBACK"); err != nil {
+		return nil, err
+	}
+
+	// optional ;
+	if p.peek().Type == TOKEN_SEMICOLON {
+		p.advance()
+	}
+
+	return &ast.RollbackStatement{}, nil
 }
 
 func (p *Parser) parsePrimary() (ast.Expression, error) {

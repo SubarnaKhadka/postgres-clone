@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 )
@@ -103,4 +104,22 @@ func (h *HeapFile) InsertTuple(data []byte) (uint32, uint16, error) {
 	}
 
 	return newPageNum, itemIndex, nil
+}
+
+func (h *HeapFile) UpdateTupleHeader(pageNum uint32, itemIdx uint16, header *TupleHeader) error {
+	page, err := h.ReadPage(pageNum)
+	if err != nil {
+		return err
+	}
+
+	if itemIdx >= page.GetItemCount() {
+		return fmt.Errorf("item index %d out of range ", itemIdx)
+	}
+
+	pointerOffset := PageHeaderSize + itemIdx*ItemPointerSize
+	tupleOffset := binary.BigEndian.Uint16(page[pointerOffset:])
+	binary.BigEndian.PutUint64(page[tupleOffset:], header.Xmin)
+	binary.BigEndian.PutUint64(page[tupleOffset+8:], header.Xmax)
+
+	return h.WritePage(pageNum, page)
 }

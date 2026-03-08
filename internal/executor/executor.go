@@ -2,11 +2,11 @@ package executor
 
 import (
 	"fmt"
-	"log/slog"
 
 	"gopostgres/internal/ast"
 	"gopostgres/internal/catalog"
 	"gopostgres/internal/storage"
+	"gopostgres/internal/txn"
 	"gopostgres/internal/types"
 )
 
@@ -17,11 +17,14 @@ type Result struct {
 }
 
 type Executor struct {
-	catalog *catalog.Catalog
+	catalog    *catalog.Catalog
+	txnManager *txn.TxnManager
+	txnXID     uint64
+	snapShot   *txn.Snapshot
 }
 
-func NewExecutor(cat *catalog.Catalog) *Executor {
-	return &Executor{catalog: cat}
+func NewExecutor(cat *catalog.Catalog, tm *txn.TxnManager, txnID uint64, snap *txn.Snapshot) *Executor {
+	return &Executor{catalog: cat, txnManager: tm, txnXID: txnID, snapShot: snap}
 }
 
 func (e *Executor) Execute(stmt ast.Statement) (*Result, error) {
@@ -34,8 +37,21 @@ func (e *Executor) Execute(stmt ast.Statement) (*Result, error) {
 		return e.executeInsert(s)
 	case *ast.SelectStatement:
 		return e.executeSelect(s)
+	case *ast.UpdateStatement:
+		return e.executeUpdate(s)
+	case *ast.DeleteStatement:
+		return e.executeDelete(s)
 	}
 	return nil, fmt.Errorf("unsupported statement type")
+}
+
+func (e *Executor) getAutoCommitWithXID() (uint64, bool) {
+	xid := e.txnXID
+	autoCommit := xid == 0
+	if autoCommit {
+		xid = e.txnManager.NextXID()
+	}
+	return xid, autoCommit
 }
 
 func (e *Executor) executeCreateTable(stmt *ast.CreateTableStatement) (*Result, error) {
@@ -117,9 +133,13 @@ func (e *Executor) executeSelect(stmt *ast.SelectStatement) (*Result, error) {
 				return nil, err
 			}
 
-			allValues, err := storage.DecodeTuple(data, table.Columns)
+			header, allValues, err := storage.DecodeTuple(data, table.Columns)
 			if err != nil {
 				return nil, err
+			}
+
+			if !e.txnManager.IsVisible(header.Xmin, header.Xmax, e.snapShot) {
+				continue
 			}
 
 			// evaluate WHERE clause - skip row if false
@@ -147,6 +167,338 @@ func (e *Executor) executeSelect(stmt *ast.SelectStatement) (*Result, error) {
 		Columns: columns,
 		Rows:    rows,
 	}, nil
+}
+
+func (e *Executor) executeUpdate(stmt *ast.UpdateStatement) (*Result, error) {
+	table, err := e.catalog.GetTable("public", stmt.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	heap, err := storage.NewHeapFile(table.OID)
+	if err != nil {
+		return nil, err
+	}
+	defer heap.Close()
+
+	updateCount := 0
+	xid, autoCommit := e.getAutoCommitWithXID()
+
+	pageCount, err := heap.PageCount()
+	if err != nil {
+		return nil, err
+	}
+	for pageNum := uint32(0); pageNum < pageCount; pageNum++ {
+		page, err := heap.ReadPage(pageNum)
+		if err != nil {
+			return nil, err
+		}
+
+		for itemIdx := uint16(0); itemIdx < page.GetItemCount(); itemIdx++ {
+			data, err := page.GetTuple(itemIdx)
+			if err != nil {
+				return nil, err
+			}
+			header, allValues, err := storage.DecodeTuple(data, table.Columns)
+			if err != nil {
+				return nil, err
+			}
+
+			if !e.txnManager.IsVisible(header.Xmin, header.Xmax, e.snapShot) {
+				continue
+			}
+
+			// evaluate where clause -skip if false
+			if stmt.Where != nil {
+				match, err := evalExpr(stmt.Where, allValues, table.Columns)
+				if err != nil {
+					return nil, err
+				}
+				if match != true {
+					continue
+				}
+			}
+
+			header.Xmax = xid
+			if err := heap.UpdateTupleHeader(pageNum, itemIdx, header); err != nil {
+				return nil, err
+			}
+
+			newValues := make([]any, len(allValues))
+			copy(newValues, allValues)
+
+			for _, clause := range stmt.SetClauses {
+				found := false
+				for i, col := range table.Columns {
+					if col.Name == clause.Column {
+						val, err := evalLiteral(clause.Value, col)
+						if err != nil {
+							if autoCommit {
+								e.txnManager.Abort(xid)
+							}
+							return nil, err
+						}
+						newValues[i] = val
+						found = true
+						break
+					}
+				}
+				if !found {
+					if autoCommit {
+						e.txnManager.Abort(xid)
+					}
+					return nil, fmt.Errorf("column %q does not exist in table %q", clause.Column, stmt.Table)
+				}
+			}
+
+			newHeader := &storage.TupleHeader{Xmin: xid, Xmax: 0}
+			newData, err := storage.EncodeTuple(newHeader, newValues, table.Columns)
+			if err != nil {
+				if autoCommit {
+					e.txnManager.Abort(xid)
+				}
+				return nil, err
+			}
+			if _, _, err := heap.InsertTuple(newData); err != nil {
+				if autoCommit {
+					e.txnManager.Abort(xid)
+				}
+				return nil, err
+			}
+
+			updateCount++
+		}
+	}
+	if autoCommit {
+		e.txnManager.Commit(xid)
+	}
+	return &Result{Tag: fmt.Sprintf("UPDATE %d", updateCount)}, nil
+}
+
+func (e *Executor) executeDelete(stmt *ast.DeleteStatement) (*Result, error) {
+	table, err := e.catalog.GetTable("public", stmt.Table)
+	if err != nil {
+		return nil, err
+	}
+
+	heap, err := storage.NewHeapFile(table.OID)
+	if err != nil {
+		return nil, err
+	}
+	defer heap.Close()
+
+	xid, autoCommit := e.getAutoCommitWithXID()
+	deleteCount := 0
+
+	pageCount, err := heap.PageCount()
+	if err != nil {
+		return nil, err
+	}
+
+	for pageNum := uint32(0); pageNum < pageCount; pageNum++ {
+		page, err := heap.ReadPage(pageNum)
+		if err != nil {
+			return nil, err
+		}
+
+		for itemIdx := uint16(0); itemIdx < page.GetItemCount(); itemIdx++ {
+			data, err := page.GetTuple(itemIdx)
+			if err != nil {
+				return nil, err
+			}
+			header, allValues, err := storage.DecodeTuple(data, table.Columns)
+			if err != nil {
+				return nil, err
+			}
+
+			if !e.txnManager.IsVisible(header.Xmin, header.Xmax, e.snapShot) {
+				continue
+			}
+
+			// evaluate where clause -skip if false
+			if stmt.Where != nil {
+				match, err := evalExpr(stmt.Where, allValues, table.Columns)
+				if err != nil {
+					return nil, err
+				}
+				if match != true {
+					continue
+				}
+			}
+
+			// mark as deleted: set max
+			header.Xmax = xid
+			if err := heap.UpdateTupleHeader(pageNum, itemIdx, header); err != nil {
+				if autoCommit {
+					e.txnManager.Abort(xid)
+				}
+				return nil, err
+			}
+			deleteCount++
+		}
+	}
+	if autoCommit {
+		e.txnManager.Commit(xid)
+	}
+	return &Result{Tag: fmt.Sprintf("DELETE %d", deleteCount)}, nil
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	default:
+		return 0, false
+	}
+}
+
+func compareFloat(l, r float64, op string) (bool, error) {
+	switch op {
+	case "=":
+		return l == r, nil
+	case "!=", "<>":
+		return l != r, nil
+	case "<":
+		return l < r, nil
+	case ">":
+		return l > r, nil
+	case "<=":
+		return l <= r, nil
+	case ">=":
+		return l >= r, nil
+	default:
+		return false, fmt.Errorf("unsupported operator %q for comparison", op)
+	}
+}
+
+func compareString(l, r string, op string) (bool, error) {
+	switch op {
+	case "=":
+		return l == r, nil
+	case "!=", "<>":
+		return l != r, nil
+	case "<":
+		return l < r, nil
+	case ">":
+		return l > r, nil
+	case "<=":
+		return l <= r, nil
+	case ">=":
+		return l >= r, nil
+	default:
+		return false, fmt.Errorf("unsupported operator %q for comparison", op)
+	}
+}
+
+func compareBool(l, r bool, op string) (bool, error) {
+	switch op {
+	case "=":
+		return l == r, nil
+	case "!=", "<>":
+		return l != r, nil
+	default:
+		return false, fmt.Errorf("unsupported operator %q for comparison", op)
+	}
+}
+
+func compareValues(left, right any, op string) (bool, error) {
+	if left == nil || right == nil {
+		return false, nil
+	}
+
+	lf, lok := toFloat64(left)
+	rf, rok := toFloat64(right)
+	if lok && rok {
+		return compareFloat(lf, rf, op)
+	}
+
+	ls, lok := left.(string)
+	rs, rok := right.(string)
+	if lok && rok {
+		return compareString(ls, rs, op)
+	}
+
+	lb, lok := left.(bool)
+	rb, rok := right.(bool)
+	if lok && rok {
+		return compareBool(lb, rb, op)
+	}
+	return false, fmt.Errorf("cannot compare %T and %T", left, right)
+}
+
+func evalExpr(expr ast.Expression, row []any, columns []*catalog.ColumnDef) (any, error) {
+	switch e := expr.(type) {
+	case *ast.IntegerLiteral:
+		return e.Value, nil
+	case *ast.FloatLiteral:
+		return e.Value, nil
+	case *ast.StringLiteral:
+		return e.Value, nil
+	case *ast.BoolLiteral:
+		return e.Value, nil
+	case *ast.NullLiteral:
+		return nil, nil
+	case *ast.ColumnRef:
+		for i, col := range columns {
+			if col.Name == e.Name {
+				return row[i], nil
+			}
+		}
+		return nil, fmt.Errorf("column %q not found", e.Name)
+
+	case *ast.IsNullExpr:
+		val, err := evalExpr(e.Expr, row, columns)
+		if err != nil {
+			return nil, err
+		}
+		if e.Not {
+			return val != nil, nil
+		}
+		return val == nil, nil
+
+	case *ast.BinaryExpr:
+		switch e.Op {
+		case "AND":
+			left, err := evalExpr(e.Left, row, columns)
+			if err != nil {
+				return nil, err
+			}
+			if left != true {
+				return false, nil
+			}
+			return evalExpr(e.Right, row, columns)
+
+		case "OR":
+			left, err := evalExpr(e.Left, row, columns)
+			if err != nil {
+				return nil, err
+			}
+			if left == true {
+				return true, nil
+			}
+			return evalExpr(e.Right, row, columns)
+
+		default:
+			left, err := evalExpr(e.Left, row, columns)
+			if err != nil {
+				return nil, err
+			}
+			right, err := evalExpr(e.Right, row, columns)
+			if err != nil {
+				return nil, err
+			}
+			return compareValues(left, right, e.Op)
+		}
+	}
+	return nil, fmt.Errorf("unsupported expression type %T", expr)
 }
 
 func (e *Executor) executeDropTable(stmt *ast.DropTableStatement) (*Result, error) {
@@ -189,8 +541,9 @@ func (e *Executor) executeInsert(stmt *ast.InsertStatement) (*Result, error) {
 			return nil, fmt.Errorf("null value in column %q violates not-null constraint", col.Name)
 		}
 	}
-
-	data, err := storage.EncodeTuple(values, columns)
+	xid, autoCommit := e.getAutoCommitWithXID()
+	header := &storage.TupleHeader{Xmin: xid, Xmax: 0}
+	data, err := storage.EncodeTuple(header, values, columns)
 	if err != nil {
 		return nil, err
 	}
@@ -203,9 +556,14 @@ func (e *Executor) executeInsert(stmt *ast.InsertStatement) (*Result, error) {
 
 	_, _, err = heap.InsertTuple(data)
 	if err != nil {
+		if autoCommit {
+			e.txnManager.Abort(xid)
+		}
 		return nil, err
 	}
-
+	if autoCommit {
+		e.txnManager.Commit(xid)
+	}
 	return &Result{Tag: "INSERT 0 1"}, nil
 }
 
@@ -225,12 +583,6 @@ func resolveColumns(table *catalog.TableDef, names []string) ([]*catalog.ColumnD
 		}
 	}
 	return columns, nil
-}
-
-func evalExpr(expr ast.Expression, row []any, columns []*catalog.ColumnDef) (any, error) {
-	slog.Info("Received params", "expr", expr, "row", row, "columns", columns)
-	// Will continue from here
-	return nil, nil
 }
 
 func evalLiteral(expr ast.Expression, col *catalog.ColumnDef) (any,

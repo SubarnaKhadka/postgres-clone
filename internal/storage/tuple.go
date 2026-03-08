@@ -9,12 +9,23 @@ import (
 	"gopostgres/internal/types"
 )
 
-func EncodeTuple(values []any, columns []*catalog.ColumnDef) ([]byte, error) {
+type TupleHeader struct {
+	Xmin uint64 // XID of the transaction that created this tuple
+	Xmax uint64 // XID of the transaction that deleted this tuple (0 = alive)
+}
+
+const TupleHeaderSize = 16 // 8 bytes xmin + 8 bytes xmax
+
+func EncodeTuple(header *TupleHeader, values []any, columns []*catalog.ColumnDef) ([]byte, error) {
 	if len(values) != len(columns) {
 		return nil, fmt.Errorf("expected %d values, got %d", len(columns), len(values))
 	}
 
 	var buf []byte
+	hdr := make([]byte, TupleHeaderSize)
+	binary.BigEndian.PutUint64(hdr[0:8], header.Xmin)
+	binary.BigEndian.PutUint64(hdr[8:16], header.Xmax)
+	buf = append(buf, hdr...)
 
 	// null bitmap: 1 bit per column, rounded up to whole bytes
 	bitmapLen := (len(columns) + 7) / 8
@@ -125,16 +136,25 @@ func encodeVariable(v any) ([]byte, error) {
 	return buf, nil
 }
 
-func DecodeTuple(data []byte, columns []*catalog.ColumnDef) ([]any,
+func DecodeTuple(data []byte, columns []*catalog.ColumnDef) (*TupleHeader, []any,
 	error,
 ) {
-	bitmapLen := (len(columns) + 7) / 8
-	if len(data) < bitmapLen {
-		return nil, fmt.Errorf("tuple data too short for null bitmap")
+	if len(data) < TupleHeaderSize {
+		return nil, nil, fmt.Errorf("tuple data too short for header")
 	}
 
-	bitmap := data[:bitmapLen]
-	offset := bitmapLen
+	header := &TupleHeader{
+		Xmin: binary.BigEndian.Uint64(data[0:8]),
+		Xmax: binary.BigEndian.Uint64(data[8:16]),
+	}
+
+	bitmapLen := (len(columns) + 7) / 8
+	if len(data) < TupleHeaderSize+bitmapLen {
+		return nil, nil, fmt.Errorf("tuple data too short for null bitmap")
+	}
+
+	bitmap := data[TupleHeaderSize : TupleHeaderSize+bitmapLen]
+	offset := TupleHeaderSize + bitmapLen
 	values := make([]any, len(columns))
 
 	for i, col := range columns {
@@ -146,18 +166,18 @@ func DecodeTuple(data []byte, columns []*catalog.ColumnDef) ([]any,
 
 		t, ok := types.TypeByOID(col.TypeOID)
 		if !ok {
-			return nil, fmt.Errorf("unknown type OID %d", col.TypeOID)
+			return nil, nil, fmt.Errorf("unknown type OID %d", col.TypeOID)
 		}
 
 		val, n, err := decodeValue(data[offset:], t)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		values[i] = val
 		offset += n
 	}
 
-	return values, nil
+	return header, values, nil
 }
 
 func decodeValue(data []byte, t *types.Type) (any, int, error) {
